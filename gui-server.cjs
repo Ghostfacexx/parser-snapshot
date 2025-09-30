@@ -50,6 +50,7 @@ let sseClients=[];
 let runs=[];
 const hosts = new Map();
 let installingBrowsers = false;
+let hostingJobs = []; // Track hosting preparation jobs
 
 // Infer a public URL for a given port depending on environment (Codespaces or local)
 function inferPublicUrl(port){
@@ -1112,6 +1113,105 @@ app.get('/api/runs/:id/prepare-suggestions',(req,res)=>{
   if(!run) return res.status(404).json({error:'run not found'});
   try { res.json(analyzeRunSmart(run)); }
   catch(e){ res.status(500).json({error:e.message}); }
+});
+
+/* ---------- Hosting Jobs API ---------- */
+// POST /api/hosting/prepare - Create a new hosting preparation job
+app.post('/api/hosting/prepare', async (req,res)=>{
+  try {
+    const { runId, options={} } = req.body || {};
+    if(!runId) return res.status(400).json({error:'runId required'});
+    
+    const run = findRun(runId);
+    if(!run) return res.status(404).json({error:'run not found'});
+    
+    const jobId = nanoid(10);
+    const jobOutDir = path.join(HOSTING_OUT_BASE, jobId);
+    fs.mkdirSync(jobOutDir, {recursive:true});
+    
+    const job = {
+      id: jobId,
+      runId,
+      status: 'preparing',
+      startedAt: Date.now(),
+      finishedAt: null,
+      options,
+      outDir: jobOutDir,
+      zip: null,
+      error: null
+    };
+    hostingJobs.push(job);
+    
+    push(`[HOSTING_PREP] job=${jobId} run=${runId} started`);
+    
+    // Run preparation asynchronously
+    (async ()=>{
+      try {
+        const prepOptions = {
+          mode: options.mode || 'switch',
+          stripAnalytics: options.stripAnalytics || false,
+          precompress: options.precompress || false,
+          noServiceWorker: !options.serviceWorker,
+          baseUrl: options.baseUrl || '',
+          noSitemap: !options.sitemap,
+          noMobile: !options.includeMobile,
+          extraAnalyticsRegex: options.extraAnalyticsRegex || '',
+          platform: options.platform || 'generic',
+          addShopifyEmbed: options.shopifyEmbed || false,
+          createZip: options.createZip !== false // default true
+        };
+        
+        const logFn = (msg) => push(`[HOSTING_PREP:${jobId}] ${msg}`);
+        const result = await prepareHosting(run.dir, jobOutDir, prepOptions, logFn);
+        
+        job.status = 'complete';
+        job.finishedAt = Date.now();
+        job.zip = result.zipPath || null;
+        job.pages = result.pages || 0;
+        push(`[HOSTING_PREP] job=${jobId} complete zip=${job.zip}`);
+      } catch(e) {
+        job.status = 'error';
+        job.finishedAt = Date.now();
+        job.error = e.message;
+        push(`[HOSTING_PREP] job=${jobId} error: ${e.message}`);
+      }
+    })();
+    
+    res.json({ ok:true, jobId, status:'preparing' });
+  } catch(e) {
+    res.status(500).json({ error:e.message });
+  }
+});
+
+// GET /api/hosting/jobs - List all hosting jobs
+app.get('/api/hosting/jobs', (req,res)=>{
+  res.json(hostingJobs.map(j=>({
+    id: j.id,
+    runId: j.runId,
+    status: j.status,
+    startedAt: j.startedAt,
+    finishedAt: j.finishedAt,
+    zip: j.zip ? true : false,
+    error: j.error,
+    pages: j.pages
+  })));
+});
+
+// GET /api/hosting/jobs/:id - Get job details
+app.get('/api/hosting/jobs/:id', (req,res)=>{
+  const job = hostingJobs.find(j=>j.id===req.params.id);
+  if(!job) return res.status(404).json({error:'job not found'});
+  res.json(job);
+});
+
+// GET /api/hosting/jobs/:id/download - Download job ZIP
+app.get('/api/hosting/jobs/:id/download', (req,res)=>{
+  const job = hostingJobs.find(j=>j.id===req.params.id);
+  if(!job) return res.status(404).json({error:'job not found'});
+  if(!job.zip || !fs.existsSync(job.zip)){
+    return res.status(404).json({error:'zip file not found'});
+  }
+  res.download(job.zip, path.basename(job.zip));
 });
 
 /* ---------- Platform Export (Shopify / WooCommerce) ---------- */
